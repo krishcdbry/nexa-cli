@@ -1,6 +1,6 @@
 [package]
 name = "nexadb-cli"
-version = "3.0.0"
+version = "3.0.4"
 edition = "2021"
 authors = ["Krish <krishcdbry@gmail.com>"]
 description = "Interactive CLI for NexaDB - The database for AI developers"

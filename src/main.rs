@@ -20,6 +20,8 @@ const MSG_DELETE: u8 = 0x05;
 const MSG_QUERY: u8 = 0x06;
 const MSG_VECTOR_SEARCH: u8 = 0x07;
 const MSG_LIST_COLLECTIONS: u8 = 0x20;
+const MSG_LIST_DATABASES: u8 = 0x40;
+const MSG_DROP_DATABASE: u8 = 0x42;
 
 // Response types
 const MSG_SUCCESS: u8 = 0x81;
@@ -55,6 +57,7 @@ struct Message {
 
 struct NexaClient {
     stream: TcpStream,
+    current_database: String,
     current_collection: Option<String>,
 }
 
@@ -67,6 +70,7 @@ impl NexaClient {
 
         let mut client = Self {
             stream,
+            current_database: "default".to_string(),
             current_collection: None,
         };
 
@@ -77,7 +81,7 @@ impl NexaClient {
         });
         client.send_message(MSG_CONNECT, &auth_data)?;
 
-        println!("{}", "✓ Connected to NexaDB v2.3.0".green().bold());
+        println!("{}", "✓ Connected to NexaDB v3.0.4".green().bold());
         println!();
 
         Ok(client)
@@ -151,7 +155,7 @@ fn print_banner() {
 ║     ██║ ╚████║███████╗██╔╝ ██╗██║  ██║██████╔╝██████╔╝              ║
 ║     ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═════╝               ║
 ║                                                                       ║
-║            Database for AI Developers - v2.3.0                       ║
+║            Database for AI Developers - v3.0.4                       ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
 
@@ -163,12 +167,18 @@ Type 'help' for commands or 'exit' to quit.
 fn print_help() {
     let help = r#"
 ╔═══════════════════════════════════════════════════════════════════╗
-║                        Nexa CLI Commands                          ║
+║                     Nexa CLI Commands (v3.0.4)                     ║
 ╚═══════════════════════════════════════════════════════════════════╝
+
+Database Management (NEW in v3.0):
+  databases                     List all databases
+  use_db <database>             Switch to a database
+  create_db <name>              Create a new database
+  drop_db <name>                Drop a database (requires confirmation)
 
 Collection Management:
   use <collection>              Switch to a collection
-  collections                   List all collections
+  collections                   List collections in current database
 
 Document Operations:
   create <json>                 Create a document
@@ -182,13 +192,13 @@ Vector Search:
                                 Search by vector similarity
 
 Examples:
-  use movies
+  databases                              # List all databases
+  use_db production                      # Switch to production database
+  create_db staging                      # Create staging database
+  use movies                             # Switch to movies collection
   create {"title": "The Matrix", "year": 1999}
   query {"year": {"$gte": 2000}}
-  update doc_abc123 {"year": 2000}
-  delete doc_abc123
   vector_search [0.1, 0.95, 0.1, 0.8] 3 4
-  count {"status": "active"}
 
 System:
   help                          Show this help
@@ -216,6 +226,119 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
         "help" => {
             print_help();
         }
+        "databases" => {
+            let msg = serde_json::json!({});
+            match client.send_message(MSG_LIST_DATABASES, &msg) {
+                Ok(result) => {
+                    if let Some(databases) = result.get("databases").and_then(|d| d.as_array()) {
+                        if databases.is_empty() {
+                            println!("{}", "⚠ No databases found".yellow());
+                        } else {
+                            println!("{}", format!("✓ Found {} database(s):", databases.len()).green());
+                            for (i, db) in databases.iter().enumerate() {
+                                let db_name = db.as_str().unwrap_or("unknown");
+                                let marker = if db_name == client.current_database {
+                                    "*"
+                                } else {
+                                    " "
+                                };
+                                println!("{} [{}] {}", marker, i + 1, db_name.cyan());
+                            }
+                        }
+                    } else {
+                        println!("{}", "⚠ No databases found".yellow());
+                    }
+                }
+                Err(e) => println!("{}", format!("✗ Error: {}", e).red()),
+            }
+        }
+        "use_db" => {
+            if parts.len() < 2 {
+                println!("{}", "✗ Database name required".red());
+                println!("{}", "Usage: use_db <database>".blue());
+                return Ok(false);
+            }
+            let database = parts[1];
+            client.current_database = database.to_string();
+            client.current_collection = None; // Reset collection when switching database
+            println!("{}", format!("✓ Switched to database '{}' (collection reset)", database).green());
+        }
+        "create_db" => {
+            if parts.len() < 2 {
+                println!("{}", "✗ Database name required".red());
+                println!("{}", "Usage: create_db <name>".blue());
+                return Ok(false);
+            }
+            let database_name = parts[1];
+
+            // Validate database name
+            if !database_name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                println!("{}", "✗ Database name must be lowercase alphanumeric with underscores".red());
+                return Ok(false);
+            }
+
+            let msg = serde_json::json!({
+                "create_database": true,
+                "database": database_name
+            });
+
+            match client.send_message(MSG_CREATE, &msg) {
+                Ok(result) => {
+                    let message = result.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Database created");
+                    println!("{}", format!("✓ {}", message).green());
+                }
+                Err(e) => println!("{}", format!("✗ Error: {}", e).red()),
+            }
+        }
+        "drop_db" => {
+            if parts.len() < 2 {
+                println!("{}", "✗ Database name required".red());
+                println!("{}", "Usage: drop_db <name>".blue());
+                return Ok(false);
+            }
+            let database_name = parts[1];
+
+            // Prevent dropping default database
+            if database_name == "default" {
+                println!("{}", "✗ Cannot drop the default database".red());
+                return Ok(false);
+            }
+
+            println!("{}", format!("⚠ You are about to drop database '{}'", database_name).yellow());
+            println!("{}", "Type 'yes' to confirm:".yellow());
+
+            // Read confirmation
+            let mut confirmation = String::new();
+            std::io::stdin().read_line(&mut confirmation)?;
+
+            if confirmation.trim().to_lowercase() != "yes" {
+                println!("{}", "✗ Drop cancelled".blue());
+                return Ok(false);
+            }
+
+            let msg = serde_json::json!({
+                "database": database_name
+            });
+
+            match client.send_message(MSG_DROP_DATABASE, &msg) {
+                Ok(result) => {
+                    let message = result.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Database dropped");
+                    println!("{}", format!("✓ {}", message).green());
+
+                    // If we dropped the current database, switch to default
+                    if client.current_database == database_name {
+                        client.current_database = "default".to_string();
+                        client.current_collection = None;
+                        println!("{}", "→ Switched to default database".blue());
+                    }
+                }
+                Err(e) => println!("{}", format!("✗ Error: {}", e).red()),
+            }
+        }
         "use" => {
             if parts.len() < 2 {
                 println!("{}", "✗ Collection name required".red());
@@ -227,7 +350,9 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
             println!("{}", format!("✓ Switched to collection '{}'", collection).green());
         }
         "collections" => {
-            let msg = serde_json::json!({});
+            let msg = serde_json::json!({
+                "database": client.current_database
+            });
             match client.send_message(MSG_LIST_COLLECTIONS, &msg) {
                 Ok(result) => {
                     if let Some(collections) = result.get("collections").and_then(|c| c.as_array()) {
@@ -265,6 +390,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
 
             let data: Value = serde_json::from_str(json_str)?;
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "data": data
             });
@@ -294,6 +420,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
             };
 
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "filters": filters,
                 "limit": 100
@@ -339,6 +466,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
 
             let data: Value = serde_json::from_str(&json_str)?;
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "document_id": doc_id,
                 "data": data
@@ -365,6 +493,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
 
             let doc_id = parts[1];
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "document_id": doc_id
             });
@@ -391,6 +520,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
 
             // Use QUERY message with limit=0 to get count without fetching all documents
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "filters": filters,
                 "limit": 0
@@ -430,6 +560,7 @@ fn handle_command(client: &mut NexaClient, line: &str) -> Result<bool> {
             let dimensions: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(vector.len());
 
             let msg = serde_json::json!({
+                "database": client.current_database,
                 "collection": client.current_collection,
                 "vector": vector,
                 "limit": limit,
@@ -502,9 +633,9 @@ fn main() -> Result<()> {
 
     loop {
         let prompt = if let Some(ref col) = client.current_collection {
-            format!("nexa({})> ", col).green().bold().to_string()
+            format!("nexa({}:{})> ", client.current_database, col).green().bold().to_string()
         } else {
-            "nexa> ".green().bold().to_string()
+            format!("nexa({})> ", client.current_database).green().bold().to_string()
         };
 
         match rl.readline(&prompt) {
